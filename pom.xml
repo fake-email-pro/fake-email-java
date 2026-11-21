@@ -5,12 +5,12 @@
   <modelVersion>4.0.0</modelVersion>
 
   <groupId>pro.fake-email</groupId>
-  <artifactId>fake-email-pro</artifactId>
+  <artifactId>fake-email-java</artifactId>
   <!-- The only place the SDK version is written: the User-Agent reads it from a filtered resource. -->
   <version>0.1.0</version>
   <packaging>jar</packaging>
 
-  <name>fake-email-pro</name>
+  <name>fake-email-java</name>
   <description>Official Java client for the fake-email.pro API: disposable mailboxes for testing signup, OTP and magic-link emails.</description>
   <url>https://fake-email.pro/api</url>
   <inceptionYear>2026</inceptionYear>

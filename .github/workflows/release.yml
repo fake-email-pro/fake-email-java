@@ -1,10 +1,9 @@
 name: Release
 
-# Publishes to Maven Central through the Central Portal (central.sonatype.com). Secrets live in the
-# `maven-central` environment of this repository:
-#   MAVEN_CENTRAL_USERNAME / MAVEN_CENTRAL_PASSWORD  - a Central Portal user token (not the login)
-#   MAVEN_GPG_PRIVATE_KEY                            - ASCII-armored private key that signs the artifacts
-#   MAVEN_GPG_PASSPHRASE                             - its passphrase
+# Published through JitPack (https://jitpack.io): it builds the tag itself (jitpack.yml) and serves the jars as
+# pro.fake-email:fake-email-java:<tag>. This workflow checks the tag, runs the tests, asks JitPack to build the
+# tag and waits for it, then creates the GitHub Release with the jars. No secrets.
+# The `release` profile in pom.xml still signs and deploys to Maven Central, should the SDK move there.
 
 on:
   push:
@@ -51,55 +50,43 @@ jobs:
       - run: ./mvnw -B -ntp spotless:check
         if: matrix.java == 25
 
-  publish:
+  jitpack:
     needs: test
     runs-on: ubuntu-latest
     environment:
-      name: maven-central
-      url: https://central.sonatype.com/artifact/pro.fake-email/fake-email-pro
+      name: jitpack
+      url: https://jitpack.io/#fake-email-pro/fake-email-java/${{ github.ref_name }}
     steps:
-      - uses: actions/checkout@v7
-
-      # Writes a settings.xml with the `central` server (credentials from the env vars below) and imports
-      # the signing key into the runner's gpg.
-      - uses: actions/setup-java@v6
-        with:
-          distribution: temurin
-          java-version: 17
-          cache: maven
-          server-id: central
-          server-username: MAVEN_CENTRAL_USERNAME
-          server-password: MAVEN_CENTRAL_PASSWORD
-          gpg-private-key: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
-          gpg-passphrase: MAVEN_GPG_PASSPHRASE
-
-      # Builds, signs, uploads and waits until the deployment is published on Maven Central.
-      - name: Publish to Maven Central
-        run: ./mvnw -B -ntp -P release deploy
-        env:
-          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
-          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
-          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: jars
-          path: |
-            target/*.jar
-            target/*.asc
-          if-no-files-found: error
+      # Requesting the pom starts the build on JitPack; it answers 200 once the jars are there. The build log
+      # is at https://jitpack.io/com/github/fake-email-pro/fake-email-java/<tag>/build.log.
+      - name: Build on JitPack
+        run: |
+          base="https://jitpack.io/com/github/fake-email-pro/fake-email-java/${GITHUB_REF_NAME}"
+          pom="${base}/fake-email-java-${GITHUB_REF_NAME}.pom"
+          for i in $(seq 1 40); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 120 "$pom")"
+            echo "attempt $i: HTTP $code"
+            if [ "$code" = "200" ]; then exit 0; fi
+            sleep 30
+          done
+          echo "::error::JitPack did not publish ${GITHUB_REF_NAME}; see ${base}/build.log"
+          curl -s "${base}/build.log" | tail -50
+          exit 1
 
   github-release:
-    needs: publish
+    needs: jitpack
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/setup-java@v6
         with:
-          name: jars
-          path: dist/
+          distribution: temurin
+          java-version: 17
+          cache: maven
+      - name: Build the jars
+        run: ./mvnw -B -ntp -DskipTests -Dgpg.skip -P release package
       - name: Create the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -113,4 +100,4 @@ jobs:
             found { print }
           ' CHANGELOG.md > notes.md
           if [ ! -s notes.md ]; then echo "See CHANGELOG.md." > notes.md; fi
-          gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file notes.md --verify-tag
+          gh release create "$GITHUB_REF_NAME" target/*.jar --title "$GITHUB_REF_NAME" --notes-file notes.md --verify-tag

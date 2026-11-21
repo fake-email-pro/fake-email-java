@@ -14,5 +14,6 @@ All notable changes to this package are documented here. The format follows
 - Typed unchecked errors per status (`QuotaExhaustedError`, `RateLimitError`, ...) with `X-RateLimit-*` state.
 - Retries on `429`/`503` honoring `Retry-After`, and on `502`/`504`/network errors for `GET` and `DELETE`.
 - Immutable record models; Java 17+, `java.net.http.HttpClient`, zero runtime dependencies.
+- Published through JitPack as `pro.fake-email:fake-email-java`.
 
 [0.1.0]: https://github.com/fake-email-pro/fake-email-java/releases/tag/v0.1.0

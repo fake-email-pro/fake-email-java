@@ -1,0 +1,8 @@
+# JitPack (https://jitpack.io) builds this repository from a tag on first request and serves the jars as
+# pro.fake-email:fake-email-java:<tag> (the TXT record git.fake-email.pro -> github.com/fake-email-pro maps the
+# group) or com.github.fake-email-pro:fake-email-java:<tag>. The release profile adds the sources and javadoc
+# jars; signing is for Maven Central only.
+jdk:
+  - openjdk17
+install:
+  - ./mvnw -B -ntp -DskipTests -Dgpg.skip -P release install

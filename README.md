@@ -1,6 +1,6 @@
 # fake-email-pro for Java
 
-[![Maven Central](https://img.shields.io/maven-central/v/pro.fake-email/fake-email-pro.svg)](https://central.sonatype.com/artifact/pro.fake-email/fake-email-pro)
+[![JitPack](https://jitpack.io/v/fake-email-pro/fake-email-java.svg)](https://jitpack.io/#fake-email-pro/fake-email-java)
 [![CI](https://github.com/fake-email-pro/fake-email-java/actions/workflows/ci.yml/badge.svg)](https://github.com/fake-email-pro/fake-email-java/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -25,21 +25,38 @@ API reference: [api.fake-email.pro/docs](https://api.fake-email.pro/docs) · Gui
 
 ## Install
 
+The SDK is published through [JitPack](https://jitpack.io/#fake-email-pro/fake-email-java): add its repository,
+then the dependency. The version is the release tag.
+
 Maven:
 
 ```xml
+<repositories>
+  <repository>
+    <id>jitpack.io</id>
+    <url>https://jitpack.io</url>
+  </repository>
+</repositories>
+
 <dependency>
   <groupId>pro.fake-email</groupId>
-  <artifactId>fake-email-pro</artifactId>
-  <version>0.1.0</version>
+  <artifactId>fake-email-java</artifactId>
+  <version>v0.1.0</version>
   <scope>test</scope>
 </dependency>
 ```
 
-Gradle:
+Gradle (Kotlin DSL):
 
 ```kotlin
-testImplementation("pro.fake-email:fake-email-pro:0.1.0")
+repositories {
+    mavenCentral()
+    maven("https://jitpack.io")
+}
+
+dependencies {
+    testImplementation("pro.fake-email:fake-email-java:v0.1.0")
+}
 ```
 
 The Java package is `pro.fakeemail` (models in `pro.fakeemail.models`); the JPMS module name is `pro.fakeemail`.
