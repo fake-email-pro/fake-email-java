@@ -57,21 +57,28 @@ jobs:
       name: jitpack
       url: https://jitpack.io/#fake-email-pro/fake-email-java/${{ github.ref_name }}
     steps:
-      # Requesting the pom starts the build on JitPack; it answers 200 once the jars are there. The build log
-      # is at https://jitpack.io/com/github/fake-email-pro/fake-email-java/<tag>/build.log.
+      # Requesting the pom starts the build on JitPack and blocks while it runs; it answers 200 once the jars are
+      # there. JitPack builds each groupId apart, so both are asked for: pro.fake-email (the TXT record
+      # git.fake-email.pro) is what the README gives, com.github.fake-email-pro works without the record.
       - name: Build on JitPack
         run: |
-          base="https://jitpack.io/com/github/fake-email-pro/fake-email-java/${GITHUB_REF_NAME}"
-          pom="${base}/fake-email-java-${GITHUB_REF_NAME}.pom"
-          for i in $(seq 1 40); do
-            code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 120 "$pom")"
-            echo "attempt $i: HTTP $code"
-            if [ "$code" = "200" ]; then exit 0; fi
-            sleep 30
+          for group in pro/fake-email com/github/fake-email-pro; do
+            base="https://jitpack.io/${group}/fake-email-java/${GITHUB_REF_NAME}"
+            pom="${base}/fake-email-java-${GITHUB_REF_NAME}.pom"
+            ok=""
+            for i in $(seq 1 30); do
+              # A long build outlasts --max-time; that is a retry, not a failure.
+              code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 300 "$pom" || true)"
+              echo "${group} attempt $i: HTTP ${code}"
+              if [ "$code" = "200" ]; then ok=1; break; fi
+              sleep 20
+            done
+            if [ -z "$ok" ]; then
+              echo "::error::JitPack did not publish ${GITHUB_REF_NAME} as ${group}; see ${base}/build.log"
+              curl -s --max-time 60 "${base}/build.log" | tail -50 || true
+              exit 1
+            fi
           done
-          echo "::error::JitPack did not publish ${GITHUB_REF_NAME}; see ${base}/build.log"
-          curl -s "${base}/build.log" | tail -50
-          exit 1
 
   github-release:
     needs: jitpack
