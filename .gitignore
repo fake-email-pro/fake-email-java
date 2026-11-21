@@ -1,0 +1,17 @@
+# Build outputs
+target/
+
+# The Maven wrapper downloads Maven itself; only its scripts and properties are committed
+.mvn/wrapper/maven-wrapper.jar
+
+# IDEs
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+.factorypath
+
+# OS junk
+.DS_Store

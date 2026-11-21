@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Java ${{ matrix.java }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The baseline (maven.compiler.release) is 17; every LTS still in use is tested.
+        java: [17, 21, 25]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: maven
+
+      - name: Build and test
+        run: ./mvnw -B -ntp verify
+
+  lint:
+    name: Format, javadoc and release artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: maven
+
+      - name: Formatting (palantir-java-format)
+        run: ./mvnw -B -ntp spotless:check
+
+      # The release profile without signing: sources and javadoc jars must build (javadoc runs doclint).
+      - name: Release artifacts
+        run: ./mvnw -B -ntp -P release -Dgpg.skip -DskipTests verify

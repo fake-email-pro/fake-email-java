@@ -1,0 +1,38 @@
+name: Spec drift
+
+# openapi/public.yaml is a copy of the spec the API serves. When the API changes, this fails so the SDK
+# (models, tests and the copy) gets updated.
+
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Fetch the live spec
+        run: curl --fail --silent --show-error --location --retry 3 https://api.fake-email.pro/docs/public.yaml -o "$RUNNER_TEMP/live.yaml"
+      - name: Compare with openapi/public.yaml
+        run: |
+          if diff -u openapi/public.yaml "$RUNNER_TEMP/live.yaml" > "$RUNNER_TEMP/spec.diff"; then
+            echo "openapi/public.yaml matches https://api.fake-email.pro/docs/public.yaml"
+            exit 0
+          fi
+          {
+            echo "## The live API spec differs from openapi/public.yaml"
+            echo
+            echo "Copy https://api.fake-email.pro/docs/public.yaml to openapi/public.yaml, run ./mvnw verify (SpecTest lists what the models miss), and update the SDK."
+            echo
+            echo '```diff'
+            cat "$RUNNER_TEMP/spec.diff"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/spec.diff"
+          echo "::error file=openapi/public.yaml::The live API spec at https://api.fake-email.pro/docs/public.yaml differs from openapi/public.yaml"
+          exit 1

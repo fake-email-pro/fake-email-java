@@ -1,0 +1,116 @@
+name: Release
+
+# Publishes to Maven Central through the Central Portal (central.sonatype.com). Secrets live in the
+# `maven-central` environment of this repository:
+#   MAVEN_CENTRAL_USERNAME / MAVEN_CENTRAL_PASSWORD  - a Central Portal user token (not the login)
+#   MAVEN_GPG_PRIVATE_KEY                            - ASCII-armored private key that signs the artifacts
+#   MAVEN_GPG_PASSPHRASE                             - its passphrase
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  check-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: maven
+
+      - name: Tag matches the pom.xml version
+        run: |
+          version="$(./mvnw -B -ntp -q help:evaluate -Dexpression=project.version -DforceStdout)"
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match the pom.xml version ${version} (expected v${version})"
+            exit 1
+          fi
+
+  test:
+    needs: check-tag
+    name: Test on Java ${{ matrix.java }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        java: [17, 25]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: maven
+      - run: ./mvnw -B -ntp verify
+      - run: ./mvnw -B -ntp spotless:check
+        if: matrix.java == 25
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    environment:
+      name: maven-central
+      url: https://central.sonatype.com/artifact/pro.fake-email/fake-email-pro
+    steps:
+      - uses: actions/checkout@v7
+
+      # Writes a settings.xml with the `central` server (credentials from the env vars below) and imports
+      # the signing key into the runner's gpg.
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: maven
+          server-id: central
+          server-username: MAVEN_CENTRAL_USERNAME
+          server-password: MAVEN_CENTRAL_PASSWORD
+          gpg-private-key: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+
+      # Builds, signs, uploads and waits until the deployment is published on Maven Central.
+      - name: Publish to Maven Central
+        run: ./mvnw -B -ntp -P release deploy
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: jars
+          path: |
+            target/*.jar
+            target/*.asc
+          if-no-files-found: error
+
+  github-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: jars
+          path: dist/
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # The release notes are this version's section of CHANGELOG.md.
+          awk -v v="$version" '
+            $0 ~ "^## \\[" v "\\]" { found = 1; next }
+            found && /^## / { exit }
+            found && /^\[[^]]+\]: / { next }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then echo "See CHANGELOG.md." > notes.md; fi
+          gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file notes.md --verify-tag
