@@ -88,8 +88,8 @@ class ClientTest {
             assertThrows(
                     IllegalArgumentException.class, () -> FakeEmail.builder().maxRetries(-1));
             assertThrows(NullPointerException.class, () -> FakeEmail.builder().httpClient(null));
-            assertThrows(
-                    IllegalArgumentException.class, () -> WaitOptions.builder().timeout(Duration.ofSeconds(-1)));
+            // A wait timeout of zero or less is accepted: the wait is already expired (WaitTest).
+            assertThrows(NullPointerException.class, () -> WaitOptions.builder().timeout(null));
             assertThrows(
                     IllegalArgumentException.class,
                     () -> RequestOptions.builder().maxRetries(-1));

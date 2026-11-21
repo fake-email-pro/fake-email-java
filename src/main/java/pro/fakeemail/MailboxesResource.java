@@ -22,8 +22,9 @@ public final class MailboxesResource {
     }
 
     /**
-     * Creates a mailbox: a random address on {@code params.domain()}, or exactly {@code localPart@domain}.
-     * Spends one unit of the monthly quota.
+     * Creates a mailbox: a random address on {@code params.domain()}, or {@code localPart@domain} (the server
+     * lowercases the local part). Spends one unit of the monthly quota. An unknown or unavailable domain is a
+     * {@link NotFoundError}.
      */
     public Mailbox create(CreateMailboxParams params) {
         Objects.requireNonNull(params, "params");
@@ -65,7 +66,10 @@ public final class MailboxesResource {
         return Decode.mailbox(http.json(call("GET", path(address))));
     }
 
-    /** Deletes the mailbox and its messages. The address is never issued again; the quota is not given back. */
+    /**
+     * Deletes the mailbox and its messages. The address is never issued again; the quota is not given back. A
+     * retry after a lost response that finds the mailbox gone is a success (the lost attempt deleted it).
+     */
     public void delete(String address) {
         http.send(call("DELETE", path(address)));
     }

@@ -41,7 +41,7 @@ Maven:
 <dependency>
   <groupId>pro.fake-email</groupId>
   <artifactId>fake-email-java</artifactId>
-  <version>v0.1.0</version>
+  <version>v0.2.0</version>
   <scope>test</scope>
 </dependency>
 ```
@@ -55,7 +55,7 @@ repositories {
 }
 
 dependencies {
-    testImplementation("pro.fake-email:fake-email-java:v0.1.0")
+    testImplementation("pro.fake-email:fake-email-java:v0.2.0")
 }
 ```
 
@@ -196,7 +196,11 @@ message.confirmLink(); // "https://..." or null
 ```
 
 `from` and `subject` are filtered on the server. A message that fails `match` is skipped and the wait continues
-with the next one. Under the hood the client repeats the server's long poll (up to 60 s each) until the deadline.
+with the next one. Under the hood the client repeats the server's long poll (up to 60 s each, never longer than the
+time left) until the deadline. Rate limits (`429`), `502`/`503`/`504`/`520`–`524`, connection errors and timeouts
+are waited out (honoring `Retry-After`) until the deadline too: the helpers end with the value or with
+`WaitTimeoutError`, whose cause is the last such failure. A timeout of zero or less throws `WaitTimeoutError` at
+once.
 
 ### The next message
 
@@ -215,7 +219,8 @@ clock. Prefer a message id: it is exact, while a time depends on clock skew. Do 
 as `after`: a second message in the same millisecond would be skipped.
 
 An `after` id that is no longer in the mailbox (you deleted that message) is a `NotFoundError`: if your tests
-delete processed messages, wait without `after`.
+delete processed messages, wait without `after`. (A message the helper skipped itself, because it failed `match`
+or had no code, may be deleted meanwhile: the helper then goes on after that message's `createdAt`.)
 
 ### Cancelling
 
@@ -233,7 +238,10 @@ DetailedMessage full = mail.messages().get(address, message.id());
 full.html(); full.text(); full.codes(); full.links(); full.attachments();
 
 DownloadedAttachment file = mail.messages().attachment(address, message.id(), full.attachments().get(0).id());
-Files.write(Path.of(file.fileName() != null ? file.fileName() : "attachment.bin"), file.data());
+// The name is the sender's (the attachment id if it gave none): keep only its last path segment
+String base = file.fileName().substring(file.fileName().replace('\\', '/').lastIndexOf('/') + 1);
+String name = base.isEmpty() || base.equals(".") || base.equals("..") ? "attachment.bin" : base;
+Files.write(Path.of(name), file.data());
 
 byte[] eml = mail.messages().raw(address, message.id()); // the message as received
 
@@ -251,7 +259,7 @@ returns an `Optional<SimpleMessage>`, empty when the server timeout passed.
 ```java
 mail.mailboxes().create(); // random address on a random domain
 mail.mailboxes().create(CreateMailboxParams.builder().domain("example.org").build()); // random address on that domain
-mail.mailboxes().create(CreateMailboxParams.builder().localPart("signup-test").domain("example.org").build()); // exactly that address
+mail.mailboxes().create(CreateMailboxParams.builder().localPart("signup-test").domain("example.org").build()); // that address (lowercased)
 
 mail.mailboxes().get(address);
 mail.mailboxes().list(PageParams.of(0, 50));
@@ -280,13 +288,13 @@ All errors are unchecked and extend `FakeEmailError`. Errors from the server are
 | `AuthenticationError`   | 401 `unauthorized`: missing, unknown, revoked or expired key                 |
 | `QuotaExhaustedError`   | 402 `quota_exhausted`: monthly mailbox quota spent (`limit`, `used`, `resetsAt`, `upgradeUrl`) |
 | `PermissionDeniedError` | 403 `plan_forbidden`: the plan does not allow this                           |
-| `NotFoundError`         | 404 `not_found`: mailbox expired, deleted or not yours; no such message     |
+| `NotFoundError`         | 404 `not_found`: mailbox expired, deleted or not yours; no such message or attachment; unknown or unavailable `domain` on create; `after` names a message not in the mailbox |
 | `ConflictError`         | 409 `address_taken`: the address was issued before                           |
 | `RateLimitError`        | 429: `code()` is `rate_limit_exceeded` or `too_many_waits`; `retryAfter()`   |
 | `InternalServerError`   | 5xx                                                                          |
 | `APIConnectionError`    | no response (DNS, refused, reset)                                            |
 | `APITimeoutError`       | an HTTP attempt took longer than the timeout                                 |
-| `WaitTimeoutError`      | `waitForMessage` / `waitForCode` / `waitForLink` reached their deadline      |
+| `WaitTimeoutError`      | `waitForMessage` / `waitForCode` / `waitForLink` reached their deadline (also when transient errors lasted until it) |
 
 ```java
 try {
@@ -302,12 +310,17 @@ try {
 The client retries up to `maxRetries` times (default 2):
 
 - `429` and `503`, for every method: the server refuses these before doing anything. The wait is `Retry-After`
-  (at most 60 s).
-- `502`, `504`, timeouts and network errors, for `GET` and `DELETE` only, never for `POST` (a mailbox could be
-  created twice). Exponential backoff with jitter: 0.5 s, 1 s, 2 s, ... up to 8 s.
+  (at most 60 s). A `503` whose `Retry-After` is over 5 s (no domain to create a mailbox on right now) is thrown
+  at once.
+- `502`, `504`, Cloudflare's `520`–`524`, timeouts and network errors, for `GET` and `DELETE` only, never for `POST`
+  (a mailbox could be created twice). Exponential backoff with jitter: 0.5 s, 1 s, 2 s, ... up to 8 s.
 
-Inside `waitForMessage` and friends, a `429` keeps being waited out while the deadline allows, and no retry is
-started that would end past the deadline.
+A `DELETE` retried after a lost response (timeout, network error, `502`/`504`/`52x`) that then gets `404` counts as
+done: the first attempt deleted it.
+
+`waitForMessage` and friends retry on their own instead: each `wait` request is sent once, transient failures are
+waited out until the deadline, and no pause or request is started that would end past it. The extra `get` of
+`waitForCode` / `waitForLink` keeps to the same deadline.
 
 Your plan's numbers are in `mail.limits().get()`. Every `APIError` carries the window state from the
 `X-RateLimit-*` headers as `rateLimit()` (`RateLimitInfo(limit, remaining, reset)`, or `null` when the server did
@@ -327,8 +340,8 @@ FakeEmail mail = FakeEmail.builder()
 ```
 
 Per-call overrides: `mail.withOptions(RequestOptions.builder().timeout(Duration.ofSeconds(5)).maxRetries(0).build())`
-returns a view of the client that shares its connections; unlike the client's timeout, its timeout also applies to
-`wait` requests.
+returns a view of the client that shares its connections. A `wait` request keeps at least its server timeout + 10 s
+per attempt: the override's timeout applies to it only when it is longer.
 
 ## Links
 

@@ -22,7 +22,7 @@ public final class CreateMailboxParams {
         return new Builder();
     }
 
-    /** Exact local part, or {@code null}. */
+    /** Local part (the server lowercases it), or {@code null}. */
     public String localPart() {
         return localPart;
     }
@@ -39,7 +39,10 @@ public final class CreateMailboxParams {
 
         private Builder() {}
 
-        /** Exact local part; requires {@link #domain} and a plan that allows custom local parts. */
+        /**
+         * Local part of the address, lowercased by the server; requires {@link #domain} and a plan that allows
+         * custom local parts.
+         */
         public Builder localPart(String localPart) {
             this.localPart = localPart;
             return this;

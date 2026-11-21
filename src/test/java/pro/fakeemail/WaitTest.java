@@ -1,11 +1,13 @@
 package pro.fakeemail;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static pro.fakeemail.Fixtures.ADDR;
 import static pro.fakeemail.Fixtures.ENC;
+import static pro.fakeemail.Fixtures.MID;
 import static pro.fakeemail.Fixtures.apiError;
 import static pro.fakeemail.Fixtures.arr;
 import static pro.fakeemail.Fixtures.detailedMessage;
@@ -14,11 +16,15 @@ import static pro.fakeemail.Fixtures.hold;
 import static pro.fakeemail.Fixtures.json;
 import static pro.fakeemail.Fixtures.obj;
 import static pro.fakeemail.Fixtures.simpleMessage;
+import static pro.fakeemail.Fixtures.text;
 
+import java.io.IOException;
+import java.net.http.HttpTimeoutException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CancellationException;
 import java.util.stream.Collectors;
 import org.junit.jupiter.api.Nested;
@@ -150,7 +156,7 @@ class WaitTest {
             SimpleMessage res = h.client.waitForMessage(ADDR);
             assertEquals("5d2e8a10-7b3c-4f1e-8a2d-9c4b6e1f3a57", res.id());
             assertEquals(5, h.requests().size());
-            // Two retries inside the request, then the loop's own pause, then one more retry.
+            // The loop owns the retries (each request is sent once): a Retry-After pause before each new request.
             assertEquals(List.of(1000L, 1000L, 1000L, 1000L), h.sleeps());
         }
 
@@ -163,28 +169,161 @@ class WaitTest {
         }
 
         @Test
-        void givesUpOnA429WhoseRetryAfterPassesTheDeadline() {
+        void aRetryAfterPastTheDeadlineIsCappedAndEndsInWaitTimeoutError() {
             Harness h = Harness.of(apiError(429, "rate_limit_exceeded", "rate limit exceeded", "Retry-After", "50"));
-            assertThrows(
-                    RateLimitError.class,
+            WaitTimeoutError err = assertThrows(
+                    WaitTimeoutError.class,
                     () -> h.client.waitForMessage(
                             ADDR, opts().timeout(Duration.ofSeconds(10)).build()));
+            assertInstanceOf(RateLimitError.class, err.getCause());
             assertEquals(1, h.requests().size());
-            assertEquals(List.of(), h.sleeps());
+            assertEquals(List.of(10_000L), h.sleeps());
         }
 
         @Test
-        void doesNotRetryPastTheDeadline() {
-            // 502 on GET is retryable, but the backoff (500 ms) would end after the deadline (300 ms away).
+        void doesNotPausePastTheDeadline() {
+            // A 502 with 300 ms left: the pause is cut to 300 ms, then the deadline is a WaitTimeoutError.
             Harness h = Harness.of((req, clock) -> {
                 clock.advance(700);
                 return FakeHttpClient.response(502, "bad gateway");
             });
-            assertThrows(
-                    InternalServerError.class,
+            WaitTimeoutError err = assertThrows(
+                    WaitTimeoutError.class,
                     () -> h.client.waitForMessage(
                             ADDR, opts().timeout(Duration.ofSeconds(1)).build()));
+            assertInstanceOf(InternalServerError.class, err.getCause());
             assertEquals(1, h.requests().size());
+            assertEquals(List.of(300L), h.sleeps());
+        }
+
+        @Test
+        void sendsEachWaitRequestOnceAndPausesASecondBetweenAttempts() {
+            // The client allows 2 retries, but the loop owns them: no 500 ms transport backoff.
+            Harness h = Harness.of(text(502, "bad gateway"), json(simpleMessage()));
+            h.client.waitForMessage(ADDR);
+            assertEquals(2, h.requests().size());
+            assertEquals(List.of(1000L), h.sleeps());
+        }
+
+        @Test
+        void waitsOutTransientStatusesAndConnectionErrors() {
+            Harness h = Harness.of(
+                    apiError(503, "internal_server_error", "service unavailable"),
+                    text(504, ""),
+                    text(520, ""),
+                    text(521, ""),
+                    text(522, ""),
+                    text(523, ""),
+                    text(524, ""),
+                    Fixtures.fail(new IOException("connection reset")),
+                    Fixtures.fail(new HttpTimeoutException("timed out")),
+                    json(simpleMessage()));
+            h.client.waitForMessage(ADDR);
+            assertEquals(10, h.requests().size());
+            assertEquals(9, h.sleeps().size());
+        }
+
+        @Test
+        void recomputesTheServerTimeoutForEachAttempt() {
+            Harness h = Harness.of(
+                    (req, clock) -> {
+                        clock.advance(3_000);
+                        return FakeHttpClient.response(503, "");
+                    },
+                    json(simpleMessage()));
+            h.client.waitForMessage(ADDR, opts().timeout(Duration.ofSeconds(10)).build());
+            // 10 s, then 3 s held and a 1 s pause: 6 s left.
+            assertEquals(List.of("10", "6"), timeouts(h));
+            assertEquals(Optional.of(Duration.ofSeconds(16)), h.request(1).timeout());
+        }
+
+        @Test
+        void anAttemptOverItsHttpTimeoutEndsInWaitTimeoutErrorAtTheDeadline() {
+            Harness h = Harness.of((req, clock) -> {
+                clock.advance(70_000);
+                throw new HttpTimeoutException("request timed out");
+            });
+            WaitTimeoutError err = assertThrows(WaitTimeoutError.class, () -> h.client.waitForMessage(ADDR));
+            assertInstanceOf(APITimeoutError.class, err.getCause());
+            assertEquals(1, h.requests().size());
+        }
+
+        @Test
+        void rethrowsClientErrorsAndPlain500AtOnce() {
+            for (int status : new int[] {400, 401, 402, 403, 409, 500}) {
+                Harness h = Harness.of(apiError(status, "x", "y"), json(simpleMessage()));
+                FakeEmailError err = assertThrows(FakeEmailError.class, () -> h.client.waitForMessage(ADDR));
+                assertEquals(status, ((APIError) err).status());
+                assertEquals(1, h.requests().size(), "status " + status);
+                assertEquals(List.of(), h.sleeps());
+            }
+        }
+
+        @Test
+        void aPerCallTimeoutNeverCutsTheWaitShort() {
+            Harness h = Harness.of(json(simpleMessage()), json(simpleMessage()));
+            h.client
+                    .withOptions(RequestOptions.builder()
+                            .timeout(Duration.ofSeconds(5))
+                            .maxRetries(3)
+                            .build())
+                    .waitForMessage(ADDR);
+            assertEquals(Optional.of(Duration.ofSeconds(70)), h.request(0).timeout());
+            h.client
+                    .withOptions(RequestOptions.builder()
+                            .timeout(Duration.ofSeconds(100))
+                            .build())
+                    .waitForMessage(ADDR);
+            assertEquals(Optional.of(Duration.ofSeconds(100)), h.request(1).timeout());
+        }
+
+        @Test
+        void aTimeoutOfZeroOrLessIsAlreadyExpired() {
+            for (Duration timeout : List.of(Duration.ZERO, Duration.ofSeconds(-5))) {
+                Harness h = Harness.of(json(simpleMessage()));
+                WaitTimeoutError err = assertThrows(
+                        WaitTimeoutError.class,
+                        () -> h.client.waitForMessage(
+                                ADDR, opts().timeout(timeout).build()));
+                assertEquals(timeout, err.timeout());
+                assertNull(err.getCause());
+                assertEquals(0, h.requests().size());
+            }
+        }
+
+        @Test
+        void continuesAfterTheTimeOfASkippedMessageThatWasDeleted() {
+            Harness h = Harness.of(
+                    json(simpleMessage("id", "m1", "subject", "Welcome")),
+                    apiError(404, "not_found", "message in after not found"),
+                    json(simpleMessage("id", "m2", "subject", "Reset your password")));
+            SimpleMessage res = h.client.waitForMessage(
+                    ADDR, opts().match(m -> m.subject().contains("password")).build());
+            assertEquals("m2", res.id());
+            assertEquals("m1", h.request(1).query().get("after"));
+            assertEquals("2026-10-22T09:06:40.102Z", h.request(2).query().get("after"));
+            assertEquals(List.of(), h.sleeps());
+        }
+
+        @Test
+        void aMissingAfterIdGivenByTheCallerIsStillNotFound() {
+            Harness h = Harness.of(apiError(404, "not_found", "message in after not found"), json(simpleMessage()));
+            assertThrows(
+                    NotFoundError.class,
+                    () -> h.client.waitForMessage(ADDR, opts().after(MID).build()));
+            assertEquals(1, h.requests().size());
+        }
+
+        @Test
+        void aMissingMailboxAfterASkippedMessageIsStillNotFound() {
+            Harness h = Harness.of(
+                    json(simpleMessage("id", "m1")),
+                    apiError(404, "not_found", "mailbox not found or expired"),
+                    json(simpleMessage("id", "m2")));
+            assertThrows(
+                    NotFoundError.class,
+                    () -> h.client.waitForMessage(ADDR, opts().match(m -> false).build()));
+            assertEquals(2, h.requests().size());
         }
 
         @Test
@@ -251,6 +390,72 @@ class WaitTest {
                     "777888", h.client.waitForCode(ADDR, opts().subject("code").build()));
             assertEquals("m1", h.request(2).query().get("after"));
             assertEquals("code", h.request(2).query().get("subject"));
+        }
+
+        @Test
+        void theFullMessageRequestKeepsToTheDeadline() {
+            Harness h = Harness.of(
+                    (req, clock) -> {
+                        clock.advance(9_500);
+                        return FakeHttpClient.response(200, Json.write(simpleMessage("id", "m1", "code", null)));
+                    },
+                    json(detailedMessage("id", "m1", "codes", arr("4242"))));
+            assertEquals(
+                    "4242",
+                    h.client.waitForCode(
+                            ADDR, opts().timeout(Duration.ofSeconds(10)).build()));
+            assertEquals(Optional.of(Duration.ofMillis(500)), h.request(1).timeout());
+        }
+
+        @Test
+        void theFullMessageRequestIsNotRetriedPastTheDeadline() {
+            Harness h = Harness.of(
+                    (req, clock) -> {
+                        clock.advance(9_800);
+                        return FakeHttpClient.response(200, Json.write(simpleMessage("id", "m1", "code", null)));
+                    },
+                    (req, clock) -> {
+                        clock.advance(100);
+                        return FakeHttpClient.response(502, "bad gateway");
+                    },
+                    json(detailedMessage("id", "m1", "codes", arr("4242"))));
+            WaitTimeoutError err = assertThrows(
+                    WaitTimeoutError.class,
+                    () -> h.client.waitForCode(
+                            ADDR, opts().timeout(Duration.ofSeconds(10)).build()));
+            assertInstanceOf(InternalServerError.class, err.getCause());
+            // The 500 ms backoff does not fit the 100 ms left; the loop's pause is cut to them.
+            assertEquals(2, h.requests().size());
+            assertEquals(List.of(100L), h.sleeps());
+        }
+
+        @Test
+        void noFullMessageRequestOnceTheDeadlinePassed() {
+            Harness h = Harness.of(
+                    (req, clock) -> {
+                        clock.advance(10_000);
+                        return FakeHttpClient.response(200, Json.write(simpleMessage("id", "m1", "code", null)));
+                    },
+                    json(detailedMessage("id", "m1", "codes", arr("4242"))));
+            WaitTimeoutError err = assertThrows(
+                    WaitTimeoutError.class,
+                    () -> h.client.waitForCode(
+                            ADDR, opts().timeout(Duration.ofSeconds(10)).build()));
+            assertInstanceOf(APITimeoutError.class, err.getCause());
+            assertEquals(1, h.requests().size());
+        }
+
+        @Test
+        void aTransientFailureOfTheFullMessageBringsTheSameMessageBack() {
+            Harness h = Harness.with(
+                    b -> b.maxRetries(0),
+                    json(simpleMessage("id", "m1", "code", null)),
+                    text(503, ""),
+                    json(simpleMessage("id", "m1", "code", null)),
+                    json(detailedMessage("id", "m1", "codes", arr("4242"))));
+            assertEquals("4242", h.client.waitForCode(ADDR));
+            assertNull(h.request(2).query().get("after"), "the message is not skipped");
+            assertEquals(List.of(1000L), h.sleeps());
         }
 
         @Test

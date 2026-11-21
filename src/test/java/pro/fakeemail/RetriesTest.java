@@ -164,6 +164,86 @@ class RetriesTest {
     }
 
     @Test
+    void aDeleteRetriedAfterALostResponseTakesA404AsDone() {
+        Harness h = Harness.of(networkError(), apiError(404, "not_found", "mailbox not found or expired"));
+        h.client.mailboxes().delete("a@example.org");
+        assertEquals(2, h.requests().size());
+
+        Harness gateway = Harness.of(text(522, ""), apiError(404, "not_found", "message not found"));
+        gateway.client.messages().delete("a@example.org", "m1");
+        assertEquals(2, gateway.requests().size());
+
+        Harness timedOut = Harness.of(
+                Fixtures.fail(new HttpTimeoutException("timed out")),
+                apiError(503, "internal_server_error", "service unavailable", "Retry-After", "1"),
+                apiError(404, "not_found", "message not found"));
+        timedOut.client.messages().delete("a@example.org", "m1");
+        assertEquals(3, timedOut.requests().size());
+    }
+
+    @Test
+    void aDeleteThatGets404FirstOrAfterARefusalIsNotFound() {
+        Harness first = Harness.of(apiError(404, "not_found", "mailbox not found or expired"));
+        assertThrows(NotFoundError.class, () -> first.client.mailboxes().delete("a@example.org"));
+
+        // 429 and 503 are refused before any effect: the 404 that follows is real.
+        Harness refused = Harness.of(limited("1"), busy(), apiError(404, "not_found", "message not found"));
+        assertThrows(NotFoundError.class, () -> refused.client.messages().delete("a@example.org", "m1"));
+        assertEquals(3, refused.requests().size());
+    }
+
+    @Test
+    void aGetRetriedAfterALostResponseStillThrowsA404() {
+        Harness h = Harness.of(badGateway(), apiError(404, "not_found", "message not found"));
+        assertThrows(NotFoundError.class, () -> h.client.messages().get("a@example.org", "m1"));
+    }
+
+    @Test
+    void retriesGetOnCloudflare52x() {
+        Harness h = Harness.with(
+                b -> b.maxRetries(5),
+                text(520, ""),
+                text(521, ""),
+                text(522, ""),
+                text(523, ""),
+                text(524, ""),
+                domains());
+        h.client.domains().list();
+        assertEquals(6, h.requests().size());
+        assertEquals(List.of(500L, 1000L, 2000L, 4000L, 8000L), h.sleeps());
+    }
+
+    @Test
+    void doesNotRetryPostOnCloudflare52x() {
+        Harness h = Harness.of(text(522, ""), json(201, mailbox()));
+        InternalServerError e = assertThrows(
+                InternalServerError.class, () -> h.client.mailboxes().create());
+        assertEquals(522, e.status());
+        assertEquals(1, h.requests().size());
+    }
+
+    @Test
+    void a503WithALongRetryAfterIsThrownAtOnce() {
+        // No domain to issue an address on: the server asks to come back in a minute.
+        Harness h = Harness.of(
+                apiError(503, "internal_server_error", "no domain available", "Retry-After", "60"),
+                json(201, mailbox()));
+        assertThrows(InternalServerError.class, () -> h.client.mailboxes().create());
+        assertEquals(1, h.requests().size());
+        assertEquals(List.of(), h.sleeps());
+    }
+
+    @Test
+    void a503WithAShortRetryAfterIsRetried() {
+        Harness h = Harness.of(
+                apiError(503, "internal_server_error", "service unavailable", "Retry-After", "5"),
+                json(201, mailbox()));
+        h.client.mailboxes().create();
+        assertEquals(2, h.requests().size());
+        assertEquals(List.of(5000L), h.sleeps());
+    }
+
+    @Test
     void doesNotRetry500Or4xx() {
         Harness h = Harness.of(apiError(500, "internal_server_error", "internal server error"));
         assertThrows(InternalServerError.class, () -> h.client.domains().list());

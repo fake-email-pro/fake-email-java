@@ -2,6 +2,7 @@ package pro.fakeemail;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Objects;
 import java.util.function.Predicate;
 import pro.fakeemail.models.SimpleMessage;
 
@@ -79,15 +80,19 @@ public final class WaitOptions {
 
         private Builder() {}
 
-        /** Client-side deadline for the whole wait (default 60 s); then {@link WaitTimeoutError}. */
+        /**
+         * Client-side deadline for the whole wait (default 60 s); then {@link WaitTimeoutError}. Zero or negative
+         * means already expired: the wait throws {@link WaitTimeoutError} at once, without a request.
+         */
         public Builder timeout(Duration timeout) {
-            this.timeout = Checks.positive(timeout, "timeout");
+            this.timeout = Objects.requireNonNull(timeout, "timeout");
             return this;
         }
 
         /**
          * Only messages strictly after this message id, e.g. the previous message's id to wait for the next one.
-         * An id that is no longer in the mailbox is a {@link NotFoundError}.
+         * An id that is not in the mailbox is a {@link NotFoundError}. (When a message the wait itself skipped is
+         * deleted meanwhile, the wait goes on after that message's time instead.)
          */
         public Builder after(String messageIdOrTime) {
             this.after = messageIdOrTime;

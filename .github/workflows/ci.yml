@@ -33,8 +33,8 @@ jobs:
       - name: Build and test
         run: ./mvnw -B -ntp verify
 
-  lint:
-    name: Format, javadoc and release artifacts
+  format:
+    name: Formatting
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -47,6 +47,19 @@ jobs:
 
       - name: Formatting (palantir-java-format)
         run: ./mvnw -B -ntp spotless:check
+
+  release-artifacts:
+    name: Javadoc and release artifacts (Java 17, as on JitPack)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The JDK JitPack builds the release with (jitpack.yml): javadoc's doclint differs between JDKs.
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: maven
 
       # The release profile without signing: sources and javadoc jars must build (javadoc runs doclint).
       - name: Release artifacts

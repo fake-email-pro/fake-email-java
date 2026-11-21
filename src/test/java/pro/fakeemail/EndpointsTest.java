@@ -313,7 +313,7 @@ class EndpointsTest {
         }
 
         @Test
-        void aPerCallTimeoutOverridesTheWaitMargin() {
+        void aShorterPerCallTimeoutDoesNotCutTheWaitShort() {
             Harness h = Harness.of(empty(204));
             h.client
                     .withOptions(RequestOptions.builder()
@@ -321,7 +321,26 @@ class EndpointsTest {
                             .build())
                     .messages()
                     .wait(ADDR);
-            assertEquals(Optional.of(Duration.ofSeconds(5)), h.request(0).timeout());
+            assertEquals(Optional.of(Duration.ofSeconds(40)), h.request(0).timeout());
+        }
+
+        @Test
+        void aLongerPerCallTimeoutLengthensTheWait() {
+            Harness h = Harness.of(empty(204));
+            h.client
+                    .withOptions(RequestOptions.builder()
+                            .timeout(Duration.ofSeconds(90))
+                            .build())
+                    .messages()
+                    .wait(ADDR);
+            assertEquals(Optional.of(Duration.ofSeconds(90)), h.request(0).timeout());
+        }
+
+        @Test
+        void theClientTimeoutDoesNotCutTheWaitShort() {
+            Harness h = Harness.with(b -> b.timeout(Duration.ofSeconds(2)), empty(204));
+            h.client.messages().wait(ADDR);
+            assertEquals(Optional.of(Duration.ofSeconds(40)), h.request(0).timeout());
         }
 
         @Test
@@ -407,6 +426,14 @@ class EndpointsTest {
             DownloadedAttachment att = h.client.messages().attachment(ADDR, MID, AID);
             assertEquals("application/octet-stream", att.contentType());
             assertNull(att.fileName());
+        }
+
+        @Test
+        void anUnnamedAttachmentIsNamedAfterItsId() {
+            // The server's fallback when the email gave no name (httpx.AttachmentDisposition).
+            Harness h = Harness.of(
+                    bytes(200, new byte[] {1}, "Content-Disposition", "attachment; filename=\"" + AID + "\""));
+            assertEquals(AID, h.client.messages().attachment(ADDR, MID, AID).fileName());
         }
     }
 

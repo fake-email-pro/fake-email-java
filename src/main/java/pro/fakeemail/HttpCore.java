@@ -26,6 +26,7 @@ final class HttpCore {
     private static final long MAX_RETRY_AFTER_MS = 60_000;
     private static final long BACKOFF_BASE_MS = 500;
     private static final long BACKOFF_MAX_MS = 8_000;
+    private static final long MAX_RETRIED_503_RETRY_AFTER_MS = 5_000;
 
     final String apiKey;
     final String baseUrl;
@@ -68,7 +69,10 @@ final class HttpCore {
         Duration timeout;
         /** {@code null} means the client's. */
         Integer maxRetries;
-        /** Clock time (ms) past which a retry is pointless: the caller has given up by then. */
+        /**
+         * Clock time (ms) the call must end by: the caller has given up then. Attempts are cut to it and no
+         * retry is started past it; {@code null} for none.
+         */
         Long deadline;
 
         Call(String method, String path) {
@@ -117,24 +121,44 @@ final class HttpCore {
         return parseBody(response.body());
     }
 
+    /**
+     * Sends the call, retrying what is safe to repeat. With a {@link Call#deadline}, every attempt's timeout is
+     * cut to the time left and no retry (pause included) is started that would end past it.
+     *
+     * <p>A {@code DELETE} retried after a lost response (timeout, connection error, 502/504/52x) that gets
+     * {@code 404} succeeded: the lost attempt did the deletion. That {@code 404} response is returned.
+     */
     HttpResponse<byte[]> send(Call call) {
         int retries = call.maxRetries != null ? call.maxRetries : maxRetries;
-        Duration attemptTimeout = call.timeout != null ? call.timeout : timeout;
-        // DELETE is idempotent here too: a repeated delete is a 404 the caller can tolerate, never a second effect.
+        Duration callTimeout = call.timeout != null ? call.timeout : timeout;
+        // DELETE is idempotent here too: a repeated delete never has a second effect.
         boolean idempotent = !call.method.equals("POST");
-        HttpRequest request = request(call, attemptTimeout);
+        boolean delete = call.method.equals("DELETE");
+        // An earlier attempt may have reached the handler although its response was lost.
+        boolean mayHaveApplied = false;
 
         for (int attempt = 0; ; attempt++) {
             if (Thread.currentThread().isInterrupted()) {
                 throw cancelled(new InterruptedException());
             }
+            Duration attemptTimeout = callTimeout;
+            if (call.deadline != null) {
+                long left = call.deadline - now();
+                if (left <= 0) {
+                    throw new APITimeoutError("the deadline passed before the request was sent", null);
+                }
+                if (left < attemptTimeout.toMillis()) {
+                    attemptTimeout = Duration.ofMillis(left);
+                }
+            }
             HttpResponse<byte[]> response;
             try {
-                response = http.send(request, HttpResponse.BodyHandlers.ofByteArray());
+                response = http.send(request(call, attemptTimeout), HttpResponse.BodyHandlers.ofByteArray());
             } catch (IOException e) {
                 FakeEmailError error = e instanceof HttpTimeoutException
                         ? new APITimeoutError("request timed out after " + attemptTimeout.toMillis() + " ms", e)
                         : new APIConnectionError("connection error: " + describe(e), e);
+                mayHaveApplied = true;
                 long delay = backoff(attempt);
                 if (idempotent && attempt < retries && fits(delay, call.deadline)) {
                     sleep(delay);
@@ -149,14 +173,22 @@ final class HttpCore {
             if (status >= 200 && status < 300) {
                 return response;
             }
+            if (status == 404 && delete && mayHaveApplied) {
+                return response;
+            }
 
             APIError error = APIError.fromResponse(status, response.headers(), errorBody(response.body()), now());
-            // 429 and 503 are refused before any effect, so even POST is safe to repeat; 502/504 may have
-            // reached the handler, so only idempotent requests are repeated.
-            boolean retryable = status == 429 || status == 503 || (idempotent && (status == 502 || status == 504));
+            Long retryAfter = RetryAfter.parseMillis(
+                    response.headers().firstValue("retry-after").orElse(null), now());
+            // 429 and 503 are refused before any effect, so even POST is safe to repeat; 502/504/52x may have
+            // reached the handler, so only idempotent requests are repeated. A 503 with a long Retry-After (no
+            // domain to issue an address on) will not clear within a retry: it is thrown at once.
+            boolean lost = isLostResponse(status);
+            mayHaveApplied |= lost;
+            boolean retryable = status == 429
+                    || (status == 503 && (retryAfter == null || retryAfter <= MAX_RETRIED_503_RETRY_AFTER_MS))
+                    || (idempotent && lost);
             if (retryable && attempt < retries) {
-                Long retryAfter = RetryAfter.parseMillis(
-                        response.headers().firstValue("retry-after").orElse(null), now());
                 long delay = retryAfter == null ? backoff(attempt) : Math.min(retryAfter, MAX_RETRY_AFTER_MS);
                 if (fits(delay, call.deadline)) {
                     sleep(delay);
@@ -165,6 +197,11 @@ final class HttpCore {
             }
             throw error;
         }
+    }
+
+    /** 502, 504 and Cloudflare's 520..524: the request may have reached the handler, the response is lost. */
+    static boolean isLostResponse(int status) {
+        return status == 502 || status == 504 || (status >= 520 && status <= 524);
     }
 
     void sleep(long millis) {

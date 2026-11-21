@@ -7,7 +7,7 @@
   <groupId>pro.fake-email</groupId>
   <artifactId>fake-email-java</artifactId>
   <!-- The only place the SDK version is written: the User-Agent reads it from a filtered resource. -->
-  <version>0.1.0</version>
+  <version>0.2.0</version>
   <packaging>jar</packaging>
 
   <name>fake-email-java</name>

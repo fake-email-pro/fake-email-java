@@ -4,7 +4,8 @@ import java.time.Duration;
 
 /**
  * {@link FakeEmail#waitForMessage}, {@link FakeEmail#waitForCode} or {@link FakeEmail#waitForLink} reached
- * their deadline without a matching message.
+ * their deadline without a matching message. When transient failures (429, 5xx gateways, timeouts) were being
+ * waited out, the last one is the {@link #getCause() cause}.
  */
 public class WaitTimeoutError extends FakeEmailError {
     private static final long serialVersionUID = 1L;

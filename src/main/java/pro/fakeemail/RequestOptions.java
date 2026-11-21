@@ -30,8 +30,8 @@ public final class RequestOptions {
     }
 
     /**
-     * Timeout of each HTTP attempt, or {@code null} for the client's. Unlike the client's timeout, it also
-     * applies to {@code wait} requests (which otherwise get their server timeout + 10 s).
+     * Timeout of each HTTP attempt, or {@code null} for the client's. A {@code wait} request always gets at least
+     * its server timeout + 10 s: this timeout applies to it only when it is longer.
      */
     public Duration timeout() {
         return timeout;
@@ -61,7 +61,7 @@ public final class RequestOptions {
 
         private Builder() {}
 
-        /** Timeout of each HTTP attempt of the call. */
+        /** Timeout of each HTTP attempt of the call; a {@code wait} request keeps at least server timeout + 10 s. */
         public Builder timeout(Duration timeout) {
             this.timeout = Checks.positive(timeout, "timeout");
             return this;

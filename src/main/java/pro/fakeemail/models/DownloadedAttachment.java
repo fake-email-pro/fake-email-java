@@ -8,7 +8,9 @@ import java.util.Objects;
  *
  * @param data the bytes (a copy is returned on each access)
  * @param contentType the response's {@code Content-Type}, {@code application/octet-stream} if absent
- * @param fileName from {@code Content-Disposition} ({@code filename*} preferred); {@code null} if absent
+ * @param fileName from {@code Content-Disposition} ({@code filename*} preferred). Never {@code null} from the
+ *     API: the attachment id when the email gave no name; {@code null} only if a proxy dropped the header. It is
+ *     chosen by the sender, so strip any directories before using it as a path
  */
 public record DownloadedAttachment(byte[] data, String contentType, String fileName) {
     public DownloadedAttachment {

@@ -42,6 +42,10 @@ public final class FakeEmail implements AutoCloseable {
     private static final int MAX_SERVER_WAIT_S = 60;
     // A 204 that comes back far earlier than asked (a server restart) is not retried in a tight loop.
     private static final long EARLY_EMPTY_PAUSE_MS = 1_000;
+    // Between attempts of the wait loop after a transient failure without Retry-After.
+    private static final long TRANSIENT_PAUSE_MS = 1_000;
+    // The 404 message of a wait whose `after` names a message that is not in the mailbox.
+    private static final String AFTER_NOT_FOUND = "message in after not found";
 
     private final HttpCore http;
     private final boolean ownsHttpClient;
@@ -144,12 +148,13 @@ public final class FakeEmail implements AutoCloseable {
     }
 
     /**
-     * Waits until a matching message arrives, repeating server long polls until the options' timeout.
+     * Waits until a matching message arrives, repeating server long polls until the options' timeout. Rate
+     * limits (429), 502/503/504/52x, connection errors and timeouts are waited out until the deadline.
      *
-     * @throws WaitTimeoutError at the deadline
+     * @throws WaitTimeoutError at the deadline (its cause is the last transient failure, if any)
      */
     public SimpleMessage waitForMessage(String address, WaitOptions options) {
-        return waitLoop(address, options, m -> m);
+        return waitLoop(address, options, (m, deadline) -> m);
     }
 
     /**
@@ -168,11 +173,11 @@ public final class FakeEmail implements AutoCloseable {
      * @throws WaitTimeoutError at the deadline
      */
     public String waitForCode(String address, WaitOptions options) {
-        return waitLoop(address, options, m -> {
+        return waitLoop(address, options, (m, deadline) -> {
             if (m.code() != null && !m.code().isEmpty()) {
                 return m.code();
             }
-            DetailedMessage full = messages.get(address, m.id());
+            DetailedMessage full = messages.getWithin(address, m.id(), deadline);
             return full.codes().isEmpty() ? null : full.codes().get(0);
         });
     }
@@ -193,22 +198,31 @@ public final class FakeEmail implements AutoCloseable {
      * @throws WaitTimeoutError at the deadline
      */
     public String waitForLink(String address, WaitOptions options) {
-        return waitLoop(address, options, m -> {
+        return waitLoop(address, options, (m, deadline) -> {
             if (m.confirmLink() != null && !m.confirmLink().isEmpty()) {
                 return m.confirmLink();
             }
-            DetailedMessage full = messages.get(address, m.id());
+            DetailedMessage full = messages.getWithin(address, m.id(), deadline);
             return full.links().isEmpty() ? null : full.links().get(0).url();
         });
     }
 
-    private <T> T waitLoop(String address, WaitOptions options, Function<SimpleMessage, T> extract) {
+    /**
+     * The loop behind the wait helpers. It owns the retries: each {@code wait} request is sent once, with a
+     * server timeout recomputed from the time left, and transient failures (429, 502, 503, 504, 520..524,
+     * connection errors and timeouts) are waited out until the deadline, which then is a {@link WaitTimeoutError}.
+     * {@code extract} gets the deadline for any extra request it makes.
+     */
+    private <T> T waitLoop(String address, WaitOptions options, Extractor<T> extract) {
         Objects.requireNonNull(address, "address");
         Objects.requireNonNull(options, "options");
         Duration timeout = options.timeout();
-        long deadline = http.now() + timeout.toMillis();
+        long deadline = http.now() + Math.max(0, timeout.toMillis());
         Predicate<SimpleMessage> match = options.match();
         String after = options.after();
+        // The last message the loop moved `after` past, for the fallback when it is deleted meanwhile.
+        SimpleMessage skipped = null;
+        FakeEmailError lastFailure = null;
 
         while (true) {
             if (Thread.currentThread().isInterrupted()) {
@@ -216,42 +230,91 @@ public final class FakeEmail implements AutoCloseable {
             }
             long remaining = deadline - http.now();
             if (remaining <= 0) {
-                throw new WaitTimeoutError(address, timeout);
+                throw waitTimeout(address, timeout, lastFailure);
             }
             int serverTimeout = (int) Math.min(MAX_SERVER_WAIT_S, Math.max(1, (remaining + 999) / 1000));
             long started = http.now();
-            Optional<SimpleMessage> received;
+            SimpleMessage message;
+            T value;
             try {
-                received =
-                        messages.waitOnce(address, serverTimeout, after, options.from(), options.subject(), deadline);
-            } catch (RateLimitError e) {
-                // The request already used its retries; a 429 (usually too_many_waits) is still worth waiting
-                // out while the caller's deadline allows.
-                long pause = e.retryAfter() != null ? e.retryAfter().toMillis() : 1_000;
-                if (http.now() + pause < deadline) {
-                    http.sleep(pause);
+                Optional<SimpleMessage> received =
+                        messages.waitOnce(address, serverTimeout, after, options.from(), options.subject(), true);
+                if (received.isEmpty()) {
+                    long pause = Math.min(EARLY_EMPTY_PAUSE_MS, deadline - http.now());
+                    if (http.now() - started < EARLY_EMPTY_PAUSE_MS && pause > 0) {
+                        http.sleep(pause);
+                    }
+                    continue;
+                }
+                message = received.get();
+                if (match != null && !match.test(message)) {
+                    after = message.id();
+                    skipped = message;
+                    continue;
+                }
+                // `after` moves past the message only once it is handled: a transient failure of the extra
+                // request brings the same message back.
+                value = extract.apply(message, deadline);
+            } catch (NotFoundError e) {
+                if (skipped != null
+                        && skipped.id().equals(after)
+                        && AFTER_NOT_FOUND.equals(APIError.stringField(e.body(), "message"))) {
+                    // The message the loop skipped was deleted meanwhile: continue after its time instead.
+                    after = Times.format(skipped.createdAt());
+                    skipped = null;
                     continue;
                 }
                 throw e;
-            }
-            if (received.isEmpty()) {
-                long pause = Math.min(EARLY_EMPTY_PAUSE_MS, deadline - http.now());
-                if (http.now() - started < EARLY_EMPTY_PAUSE_MS && pause > 0) {
-                    http.sleep(pause);
+            } catch (APIError | APIConnectionError e) {
+                if (!isTransient(e)) {
+                    throw e;
+                }
+                lastFailure = e;
+                long left = deadline - http.now();
+                if (left > 0) {
+                    Long retryAfter = retryAfterMillis(e);
+                    http.sleep(Math.min(retryAfter != null ? retryAfter : TRANSIENT_PAUSE_MS, left));
                 }
                 continue;
             }
-            SimpleMessage message = received.get();
             // Continue strictly after this message whatever happens next: its id is exact, a time is not.
             after = message.id();
-            if (match != null && !match.test(message)) {
-                continue;
-            }
-            T value = extract.apply(message);
+            skipped = message;
             if (value != null) {
                 return value;
             }
         }
+    }
+
+    /** What the wait helpers return for a message, or {@code null} to skip it. */
+    @FunctionalInterface
+    private interface Extractor<T> {
+        T apply(SimpleMessage message, long deadline);
+    }
+
+    /** Failures the wait loop waits out: the server is busy or the response was lost, nothing is wrong. */
+    private static boolean isTransient(FakeEmailError e) {
+        if (e instanceof APIConnectionError) {
+            return true; // timeouts included
+        }
+        int status = ((APIError) e).status();
+        return status == 429 || status == 503 || HttpCore.isLostResponse(status);
+    }
+
+    private Long retryAfterMillis(FakeEmailError e) {
+        if (!(e instanceof APIError)) {
+            return null;
+        }
+        String header = ((APIError) e).headers().firstValue("retry-after").orElse(null);
+        return RetryAfter.parseMillis(header, http.now());
+    }
+
+    private static WaitTimeoutError waitTimeout(String address, Duration timeout, FakeEmailError cause) {
+        WaitTimeoutError error = new WaitTimeoutError(address, timeout);
+        if (cause != null) {
+            error.initCause(cause);
+        }
+        return error;
     }
 
     /**
@@ -315,7 +378,11 @@ public final class FakeEmail implements AutoCloseable {
             return this;
         }
 
-        /** Retries on 429/503, and on 502/504/network errors for GET and DELETE (default 2). */
+        /**
+         * Retries on 429 and 503 (unless its {@code Retry-After} is over 5 s), and on 502/504/520..524/network
+         * errors and timeouts for GET and DELETE (default 2). The wait helpers retry on their own until their
+         * deadline instead.
+         */
         public Builder maxRetries(int maxRetries) {
             this.maxRetries = Checks.notNegative(maxRetries, "maxRetries");
             return this;
